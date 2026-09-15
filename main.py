@@ -1,13 +1,23 @@
 import time
-import schedule
 import json
+import threading
 import urllib.request
 import pandas as pd
 import numpy as np
 from datetime import datetime
+import streamlit as st
 
 BOT_TOKEN = "8942257131:AAGSFvdiXFq5_y_kwKNYfnCSNb28l1JgIiA"
 CHAT_ID = "8574214847"
+
+WATCHLIST = [
+    "RELIANCE.NS", "TCS.NS", "HDFCBANK.NS", "ICICIBANK.NS", "INFY.NS",
+    "BHARTIARTL.NS", "ITC.NS", "SBIN.NS", "LT.NS", "BAJFINANCE.NS",
+    "HCLTECH.NS", "MARUTI.NS", "SUNPHARMA.NS", "TATAMOTORS.NS", "KOTAKBANK.NS",
+    "AXISBANK.NS", "TITAN.NS", "M&M.NS", "TATASTEEL.NS", "ASIANPAINT.NS"
+]
+
+signals_history = []
 
 def send_telegram(text: str):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
@@ -18,16 +28,7 @@ def send_telegram(text: str):
         with urllib.request.urlopen(req, timeout=10) as resp:
             pass
     except Exception as e:
-        print(f"Error: {e}")
-
-WATCHLIST = [
-    "RELIANCE.NS", "TCS.NS", "HDFCBANK.NS", "ICICIBANK.NS", "INFY.NS",
-    "BHARTIARTL.NS", "ITC.NS", "SBIN.NS", "LT.NS", "BAJFINANCE.NS",
-    "HCLTECH.NS", "MARUTI.NS", "SUNPHARMA.NS", "TATAMOTORS.NS", "KOTAKBANK.NS",
-    "AXISBANK.NS", "TITAN.NS", "M&M.NS", "TATASTEEL.NS", "ASIANPAINT.NS"
-]
-
-triggered_today = set()
+        print(f"Telegram error: {e}")
 
 def fetch_data(symbol: str):
     end_t = int(time.time())
@@ -55,7 +56,6 @@ def fetch_data(symbol: str):
 def evaluate(df: pd.DataFrame, symbol: str):
     if len(df) < 55:
         return None
-
     df['ema_20'] = df['close'].ewm(span=20, adjust=False).mean()
     df['ema_50'] = df['close'].ewm(span=50, adjust=False).mean()
     df['vol_sma20'] = df['volume'].rolling(window=20).mean()
@@ -75,7 +75,6 @@ def evaluate(df: pd.DataFrame, symbol: str):
     df['high_20d'] = df['high'].shift(1).rolling(window=20).max()
 
     curr = df.iloc[-1]
-
     if curr['close'] < curr['ema_50'] or curr['rsi'] > 78:
         return None
     if (curr['close'] > curr['high_20d']) and (curr['vol_surge'] < 1.3):
@@ -83,7 +82,6 @@ def evaluate(df: pd.DataFrame, symbol: str):
 
     score = 0
     reasons = []
-
     if curr['vol_surge'] >= 1.8:
         score += 30
         reasons.append(f"Volume Surge ({curr['vol_surge']:.1f}x)")
@@ -100,51 +98,65 @@ def evaluate(df: pd.DataFrame, symbol: str):
 
     if 55 <= curr['rsi'] <= 70:
         score += 15
-        reasons.append("RSI in Bullish Zone")
+        reasons.append("RSI Bullish")
 
-    if score >= 80:
+    if score >= 70:
         entry = round(curr['close'], 2)
         atr_val = curr['atr']
         return {
-            "symbol": symbol.replace(".NS", ""),
-            "action": "STRONG BUY",
-            "score": score,
-            "entry": entry,
-            "target_1": round(entry + (1.5 * atr_val), 2),
-            "target_2": round(entry + (2.5 * atr_val), 2),
-            "stop_loss": round(entry - (1.0 * atr_val), 2),
-            "reasons": " + ".join(reasons)
+            "Time": datetime.now().strftime("%H:%M:%S"),
+            "Stock": symbol.replace(".NS", ""),
+            "Score": score,
+            "Price": entry,
+            "Target 1": round(entry + (1.5 * atr_val), 2),
+            "Target 2": round(entry + (2.5 * atr_val), 2),
+            "Stop Loss": round(entry - (1.0 * atr_val), 2),
+            "Reasons": " + ".join(reasons)
         }
     return None
 
-def run_scan():
-    for sym in WATCHLIST:
-        if sym in triggered_today:
-            continue
-        df = fetch_data(sym)
-        if df is None:
-            continue
-        sig = evaluate(df, sym)
-        if sig:
-            msg = (
-                f"🚨 *ALPHA CLOUD SIGNAL* 🚨\n\n"
-                f"🟢 *Stock:* `{sig['symbol']}`\n"
-                f"*Action:* {sig['action']} (Score: {sig['score']}/100)\n\n"
-                f"🔹 *Entry:* ₹{sig['entry']}\n"
-                f"🎯 *Target 1:* ₹{sig['target_1']}\n"
-                f"🎯 *Target 2:* ₹{sig['target_2']}\n"
-                f"🛑 *Stop Loss:* ₹{sig['stop_loss']}\n\n"
-                f"📌 *Reasons:* {sig['reasons']}"
-            )
-            send_telegram(msg)
-            triggered_today.add(sym)
-            time.sleep(1)
-
-if __name__ == "__main__":
-    send_telegram("☁️ *Owl Alpha Hunter Live!* अब यह क्लाउड सर्वर पर 24 घंटे एक्टिव रहेगा।")
-    schedule.every(15).minutes.do(run_scan)
-    schedule.every().day.at("00:00").do(lambda: triggered_today.clear())
-    run_scan()
+def background_scanner():
     while True:
-        schedule.run_pending()
-        time.sleep(1)
+        for sym in WATCHLIST:
+            df = fetch_data(sym)
+            if df is not None:
+                sig = evaluate(df, sym)
+                if sig and not any(s['Stock'] == sig['Stock'] for s in signals_history[-20:]):
+                    signals_history.insert(0, sig)
+                    msg = (
+                        f"🚨 *ALPHA APP SIGNAL* 🚨\n\n"
+                        f"🟢 *Stock:* `{sig['Stock']}` (Score: {sig['Score']}/100)\n"
+                        f"🔹 *Entry:* ₹{sig['Price']}\n"
+                        f"🎯 *Target 1:* ₹{sig['Target 1']}\n"
+                        f"🎯 *Target 2:* ₹{sig['Target 2']}\n"
+                        f"🛑 *Stop Loss:* ₹{sig['Stop Loss']}\n"
+                        f"📌 *Signal:* {sig['Reasons']}"
+                    )
+                    send_telegram(msg)
+            time.sleep(1)
+        time.sleep(300)
+
+if "started" not in st.session_state:
+    st.session_state.started = True
+    t = threading.Thread(target=background_scanner, daemon=True)
+    t.start()
+
+# --- STREAMLIT UI DASHBOARD ---
+st.set_page_config(page_title="Alpha Hunter", page_icon="📈", layout="wide")
+st.title("🎯 Owl Alpha Hunter - Live Market Scanner")
+st.caption("24/7 Cloud Bot & Technical Radar Dashboard")
+
+col1, col2, col3 = st.columns(3)
+col1.metric("Status", "ONLINE 🟢")
+col2.metric("Watchlist Count", len(WATCHLIST))
+col3.metric("Signals Today", len(signals_history))
+
+st.subheader("⚡ Live Breakout Signals")
+if signals_history:
+    df_signals = pd.DataFrame(signals_history)
+    st.dataframe(df_signals, use_container_width=True)
+else:
+    st.info("स्कैनर चालू है... जैसे ही किसी शेयर में 70+ स्कोर बनेगा, यहाँ लाइव लिस्ट आ जाएगी और टेलीग्राम पर भी मैसेज जाएगा।")
+
+if st.button("🔄 Manual Scan Run"):
+    st.rerun()
