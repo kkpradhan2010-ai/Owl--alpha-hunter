@@ -10,11 +10,20 @@ import streamlit as st
 BOT_TOKEN = "8942257131:AAGSFvdiXFq5_y_kwKNYfnCSNb28l1JgIiA"
 CHAT_ID = "8574214847"
 
+# Top 60 High-Conviction Liquid Stocks
 WATCHLIST = [
     "RELIANCE.NS", "TCS.NS", "HDFCBANK.NS", "ICICIBANK.NS", "INFY.NS",
     "BHARTIARTL.NS", "ITC.NS", "SBIN.NS", "LT.NS", "BAJFINANCE.NS",
     "HCLTECH.NS", "MARUTI.NS", "SUNPHARMA.NS", "TATAMOTORS.NS", "KOTAKBANK.NS",
-    "AXISBANK.NS", "TITAN.NS", "M&M.NS", "TATASTEEL.NS", "ASIANPAINT.NS"
+    "AXISBANK.NS", "TITAN.NS", "M&M.NS", "TATASTEEL.NS", "ASIANPAINT.NS",
+    "ADANIENT.NS", "ADANIPORTS.NS", "COALINDIA.NS", "BAJAJFINSV.NS", "NTPC.NS",
+    "POWERGRID.NS", "ONGC.NS", "NESTLEIND.NS", "ULTRACEMCO.NS", "JSWSTEEL.NS",
+    "GRASIM.NS", "HINDUNILVR.NS", "HINDALCO.NS", "WIPRO.NS", "TECHM.NS",
+    "CIPLA.NS", "DRREDDY.NS", "APOLLOHOSP.NS", "EICHERMOT.NS", "DIVISLAB.NS",
+    "BPCL.NS", "BRITANNIA.NS", "HEROMOTOCO.NS", "TATACONSUM.NS", "INDUSINDBK.NS",
+    "BEL.NS", "HAL.NS", "TRENT.NS", "ZOMATO.NS", "JIOFIN.NS",
+    "CHOLAFIN.NS", "VEDL.NS", "DLF.NS", "VBL.NS", "SIEMENS.NS",
+    "PFC.NS", "RECLTD.NS", "BHEL.NS", "IRFC.NS", "RVNL.NS"
 ]
 
 signals_history = []
@@ -56,6 +65,7 @@ def fetch_data(symbol: str):
 def evaluate(df: pd.DataFrame, symbol: str):
     if len(df) < 55:
         return None
+        
     df['ema_20'] = df['close'].ewm(span=20, adjust=False).mean()
     df['ema_50'] = df['close'].ewm(span=50, adjust=False).mean()
     df['vol_sma20'] = df['volume'].rolling(window=20).mean()
@@ -75,34 +85,46 @@ def evaluate(df: pd.DataFrame, symbol: str):
     df['high_20d'] = df['high'].shift(1).rolling(window=20).max()
 
     curr = df.iloc[-1]
-    if curr['close'] < curr['ema_50'] or curr['rsi'] > 78:
-        return None
-    if (curr['close'] > curr['high_20d']) and (curr['vol_surge'] < 1.3):
+    
+    # Basic Safety Rules
+    if curr['close'] < curr['ema_50'] or curr['rsi'] > 80 or curr['rsi'] < 45:
         return None
 
     score = 0
     reasons = []
-    if curr['vol_surge'] >= 1.8:
-        score += 30
-        reasons.append(f"Volume Surge ({curr['vol_surge']:.1f}x)")
-    elif curr['vol_surge'] >= 1.3:
-        score += 15
 
+    # 1. Trend Structure (EMA Stack)
     if curr['close'] > curr['ema_20'] > curr['ema_50']:
+        score += 35
+        reasons.append("Super Bullish Trend")
+    elif curr['close'] > curr['ema_20']:
+        score += 20
+        reasons.append("Above 20 EMA")
+
+    # 2. Volume Activity
+    if curr['vol_surge'] >= 1.5:
         score += 30
-        reasons.append("Bullish Trend Stack")
-
-    if curr['close'] > curr['high_20d']:
-        score += 25
-        reasons.append("20-Day Breakout")
-
-    if 55 <= curr['rsi'] <= 70:
+        reasons.append(f"High Vol ({curr['vol_surge']:.1f}x)")
+    elif curr['vol_surge'] >= 1.0:
         score += 15
-        reasons.append("RSI Bullish")
+        reasons.append("Above Avg Vol")
 
-    if score >= 70:
+    # 3. Momentum (RSI)
+    if 55 <= curr['rsi'] <= 72:
+        score += 20
+        reasons.append(f"RSI Strong ({int(curr['rsi'])})")
+    elif curr['rsi'] > 50:
+        score += 10
+
+    # 4. Breakout Bonus
+    if curr['close'] >= curr['high_20d'] * 0.98:  # Breakout ya breakout ke bilkul paas
+        score += 15
+        reasons.append("Near/At 20D High")
+
+    # Cutoff Score >= 60 for High Conviction
+    if score >= 60:
         entry = round(curr['close'], 2)
-        atr_val = curr['atr']
+        atr_val = curr['atr'] if pd.notna(curr['atr']) else (entry * 0.02)
         return {
             "Time": datetime.now().strftime("%H:%M:%S"),
             "Stock": symbol.replace(".NS", ""),
@@ -111,29 +133,40 @@ def evaluate(df: pd.DataFrame, symbol: str):
             "Target 1": round(entry + (1.5 * atr_val), 2),
             "Target 2": round(entry + (2.5 * atr_val), 2),
             "Stop Loss": round(entry - (1.0 * atr_val), 2),
-            "Reasons": " + ".join(reasons)
+            "Signal": " + ".join(reasons)
         }
     return None
 
+def scan_all_stocks():
+    global signals_history
+    new_signals = []
+    for sym in WATCHLIST:
+        df = fetch_data(sym)
+        if df is not None:
+            sig = evaluate(df, sym)
+            if sig:
+                new_signals.append(sig)
+        time.sleep(0.3)
+    
+    # Sort by highest score
+    new_signals.sort(key=lambda x: x['Score'], reverse=True)
+    signals_history = new_signals
+
 def background_scanner():
     while True:
-        for sym in WATCHLIST:
-            df = fetch_data(sym)
-            if df is not None:
-                sig = evaluate(df, sym)
-                if sig and not any(s['Stock'] == sig['Stock'] for s in signals_history[-20:]):
-                    signals_history.insert(0, sig)
-                    msg = (
-                        f"🚨 *ALPHA APP SIGNAL* 🚨\n\n"
-                        f"🟢 *Stock:* `{sig['Stock']}` (Score: {sig['Score']}/100)\n"
-                        f"🔹 *Entry:* ₹{sig['Price']}\n"
-                        f"🎯 *Target 1:* ₹{sig['Target 1']}\n"
-                        f"🎯 *Target 2:* ₹{sig['Target 2']}\n"
-                        f"🛑 *Stop Loss:* ₹{sig['Stop Loss']}\n"
-                        f"📌 *Signal:* {sig['Reasons']}"
-                    )
-                    send_telegram(msg)
-            time.sleep(1)
+        scan_all_stocks()
+        # Top signals Telegram alert
+        for sig in signals_history[:3]:
+            msg = (
+                f"🚨 *ALPHA HUNTER RADAR* 🚨\n\n"
+                f"🟢 *Stock:* `{sig['Stock']}` (Score: {sig['Score']}/100)\n"
+                f"🔹 *Entry:* ₹{sig['Price']}\n"
+                f"🎯 *Target 1:* ₹{sig['Target 1']}\n"
+                f"🎯 *Target 2:* ₹{sig['Target 2']}\n"
+                f"🛑 *Stop Loss:* ₹{sig['Stop Loss']}\n"
+                f"📌 *Signal:* {sig['Signal']}"
+            )
+            send_telegram(msg)
         time.sleep(300)
 
 if "started" not in st.session_state:
@@ -143,20 +176,23 @@ if "started" not in st.session_state:
 
 # --- STREAMLIT UI DASHBOARD ---
 st.set_page_config(page_title="Alpha Hunter", page_icon="📈", layout="wide")
-st.title("🎯 Owl Alpha Hunter - Live Market Scanner")
-st.caption("24/7 Cloud Bot & Technical Radar Dashboard")
+st.title("🎯 Owl Alpha Hunter - Live Market Radar")
+st.caption("Auto Cloud Bot & Momentum Scanner")
 
 col1, col2, col3 = st.columns(3)
 col1.metric("Status", "ONLINE 🟢")
 col2.metric("Watchlist Count", len(WATCHLIST))
-col3.metric("Signals Today", len(signals_history))
+col3.metric("Filtered Stocks", len(signals_history))
 
-st.subheader("⚡ Live Breakout Signals")
+st.subheader("⚡ Top Filtered Stocks (Ranked by Score)")
+
 if signals_history:
     df_signals = pd.DataFrame(signals_history)
     st.dataframe(df_signals, use_container_width=True)
 else:
-    st.info("स्कैनर चालू है... जैसे ही किसी शेयर में 70+ स्कोर बनेगा, यहाँ लाइव लिस्ट आ जाएगी और टेलीग्राम पर भी मैसेज जाएगा।")
+    st.info("डेटा स्कैन हो रहा है... कृपया 30-40 सेकंड प्रतीक्षा करें या नीचे दिए गए बटन पर क्लिक करें।")
 
 if st.button("🔄 Manual Scan Run"):
+    with st.spinner("स्कैनिंग जारी है..."):
+        scan_all_stocks()
     st.rerun()
