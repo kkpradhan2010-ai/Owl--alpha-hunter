@@ -1,883 +1,166 @@
-# stock_ai.py
-# Multi-Factor NSE Stock Scanner
-# News + FII/DII + Volume + Results + OI + Options
-# + Technical + Sector + Corporate Events + Risk
-
-import numpy as np
+import time
+import json
+import threading
+import yfinance as yf
 import pandas as pd
-from dataclasses import dataclass
+import numpy as np
+from datetime import datetime
+import streamlit as st
 
+BOT_TOKEN = "8942257131:AAGSFvdiXFq5_y_kwKNYfnCSNb28l1JgIiA"
+CHAT_ID = "8574214847"
 
-# ============================================================
-# 1. 200 STOCKS
-# ============================================================
-
+# NIFTY TOP 50 LIQUID STOCKS
 STOCKS = [
-    "RELIANCE", "HDFCBANK", "ICICIBANK", "TCS", "INFY",
-    "BHARTIARTL", "SBIN", "ITC", "LT", "AXISBANK",
-    "KOTAKBANK", "M&M", "HINDUNILVR", "SUNPHARMA", "MARUTI",
-    "TITAN", "ADANIPORTS", "NTPC", "POWERGRID", "BAJFINANCE",
-    "BAJAJFINSV", "HCLTECH", "WIPRO", "ULTRACEMCO", "ASIANPAINT",
-    "NESTLEIND", "TATASTEEL", "JSWSTEEL", "ONGC", "COALINDIA",
-    "ADANIENT", "TECHM", "TATAMOTORS", "HINDALCO", "GRASIM",
-    "CIPLA", "DRREDDY", "EICHERMOT", "DIVISLAB", "BRITANNIA",
-    "APOLLOHOSP", "SBILIFE", "HDFCLIFE", "INDUSINDBK",
-    "BAJAJ-AUTO", "HEROMOTOCO", "TRENT", "BEL", "HAL",
-    "DLF", "PIDILITIND", "SIEMENS"
+    "RELIANCE.NS", "HDFCBANK.NS", "ICICIBANK.NS", "TCS.NS", "INFY.NS",
+    "BHARTIARTL.NS", "SBIN.NS", "ITC.NS", "LT.NS", "AXISBANK.NS",
+    "KOTAKBANK.NS", "M&M.NS", "HINDUNILVR.NS", "SUNPHARMA.NS", "MARUTI.NS",
+    "TITAN.NS", "ADANIPORTS.NS", "NTPC.NS", "POWERGRID.NS", "BAJFINANCE.NS",
+    "BAJAJFINSV.NS", "HCLTECH.NS", "WIPRO.NS", "ULTRACEMCO.NS", "ASIANPAINT.NS",
+    "NESTLEIND.NS", "TATASTEEL.NS", "JSWSTEEL.NS", "ONGC.NS", "COALINDIA.NS",
+    "ADANIENT.NS", "TECHM.NS", "TATAMOTORS.NS", "HINDALCO.NS", "GRASIM.NS",
+    "CIPLA.NS", "DRREDDY.NS", "EICHERMOT.NS", "DIVISLAB.NS", "BRITANNIA.NS",
+    "APOLLOHOSP.NS", "SBILIFE.NS", "HDFCLIFE.NS", "INDUSINDBK.NS",
+    "HEROMOTOCO.NS", "TRENT.NS", "BEL.NS", "HAL.NS", "DLF.NS", "SIEMENS.NS"
 ]
-
-# बाद में इस list को exact 200 stocks तक बढ़ाएँ
-
-
-# ============================================================
-# 2. FACTOR WEIGHTS
-# ============================================================
 
 WEIGHTS = {
-
-    "news":       0.12,
-    "fii_dii":    0.08,
-    "volume":     0.12,
-    "delivery":   0.06,
-
-    "results":    0.12,
-    "technical":  0.12,
-
-    "oi":         0.10,
-    "options":    0.07,
-
-    "sector":     0.05,
-    "corporate":  0.06,
-
-    "momentum":   0.06,
-    "risk":       0.04
+    "technical":  0.30,
+    "volume":     0.25,
+    "momentum":   0.25,
+    "risk":       0.20
 }
 
-
-# ============================================================
-# 3. BASIC FUNCTIONS
-# ============================================================
-
 def limit_score(value):
-
     return max(-100, min(100, float(value)))
 
+def send_telegram(text: str):
+    import urllib.request
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    payload = json.dumps({"chat_id": CHAT_ID, "text": text, "parse_mode": "Markdown"}).encode('utf-8')
+    headers = {"Content-Type": "application/json"}
+    try:
+        req = urllib.request.Request(url, data=payload, headers=headers)
+        with urllib.request.urlopen(req, timeout=10):
+            pass
+    except Exception:
+        pass
 
-def weighted_score(factors):
+def calculate_factors(df):
+    close = df["Close"]
+    vol = df["Volume"]
 
-    total = 0
+    # 1. Technical Trend (EMA Stack + 20D High)
+    ema20 = close.ewm(span=20).mean().iloc[-1]
+    ema50 = close.ewm(span=50).mean().iloc[-1]
+    prev_high = close.shift(1).rolling(20).max().iloc[-1]
+    curr_close = close.iloc[-1]
 
-    for factor, weight in WEIGHTS.items():
+    tech_score = 0
+    if curr_close > ema20: tech_score += 35
+    else: tech_score -= 35
+    if ema20 > ema50: tech_score += 35
+    else: tech_score -= 35
+    if curr_close >= prev_high * 0.985: tech_score += 30
 
-        value = factors.get(factor, 0)
+    # 2. Volume Surge
+    avg_vol = vol.rolling(20).mean().iloc[-1]
+    vol_ratio = vol.iloc[-1] / (avg_vol + 1e-6)
+    v_score = (vol_ratio - 1.0) * 80
 
-        total += value * weight
-
-    return limit_score(total)
-
-
-# ============================================================
-# 4. TECHNICAL ANALYSIS
-# ============================================================
-
-def technical_score(df):
-
-    close = df["close"]
-
-    ema20 = close.ewm(span=20).mean()
-    ema50 = close.ewm(span=50).mean()
-    ema200 = close.ewm(span=200).mean()
-
-    score = 0
-
-    # Trend
-
-    if close.iloc[-1] > ema20.iloc[-1]:
-        score += 25
-    else:
-        score -= 25
-
-    if ema20.iloc[-1] > ema50.iloc[-1]:
-        score += 25
-    else:
-        score -= 25
-
-    if ema50.iloc[-1] > ema200.iloc[-1]:
-        score += 25
-    else:
-        score -= 25
-
-
-    # 20-day breakout
-
-    previous_high = close.shift(1).rolling(20).max().iloc[-1]
-    previous_low = close.shift(1).rolling(20).min().iloc[-1]
-
-    if close.iloc[-1] > previous_high:
-
-        score += 25
-
-    elif close.iloc[-1] < previous_low:
-
-        score -= 25
-
-
-    return limit_score(score)
-
-
-# ============================================================
-# 5. RSI / MOMENTUM
-# ============================================================
-
-def momentum_score(df):
-
-    close = df["close"]
-
+    # 3. RSI Momentum
     delta = close.diff()
-
     gain = delta.clip(lower=0).rolling(14).mean()
-
     loss = (-delta.clip(upper=0)).rolling(14).mean()
-
     rs = gain / loss.replace(0, np.nan)
-
-    rsi = 100 - (100 / (1 + rs))
-
-    rsi_value = rsi.iloc[-1]
-
-    score = (rsi_value - 50) * 2.5
-
-    # बहुत ज्यादा overbought होने पर penalty
-
-    if rsi_value > 80:
-        score -= 30
-
-    # बहुत ज्यादा oversold होने पर bounce possibility
-
-    if rsi_value < 20:
-        score += 30
-
-    return limit_score(score)
-
-
-# ============================================================
-# 6. ABNORMAL VOLUME
-# ============================================================
-
-def volume_score(df):
-
-    volume = df["volume"]
-
-    avg_volume = volume.rolling(20).mean().iloc[-1]
-
-    current_volume = volume.iloc[-1]
-
-    ratio = current_volume / avg_volume
-
-    price_change = (
-        df["close"].iloc[-1] /
-        df["close"].iloc[-2] - 1
-    )
-
-    score = (ratio - 1) * 100
-
-    # Volume + price confirmation
-
-    if ratio > 1.5:
-
-        if price_change > 0:
-            score += 25
-        else:
-            score -= 25
-
-    return limit_score(score)
-
-
-# ============================================================
-# 7. NEWS ENGINE
-# ============================================================
-
-POSITIVE_NEWS = [
-
-    "order win",
-    "large order",
-    "new order",
-    "contract",
-    "profit rises",
-    "profit growth",
-    "revenue growth",
-    "earnings beat",
-    "rating upgrade",
-    "upgrade",
-    "acquisition",
-    "merger",
-    "buyback",
-    "dividend",
-    "capacity expansion",
-    "new plant",
-    "production increase",
-    "partnership",
-    "investment"
-
-]
-
-NEGATIVE_NEWS = [
-
-    "fraud",
-    "investigation",
-    "default",
-    "downgrade",
-    "rating downgrade",
-    "resignation",
-    "promoter pledge",
-    "penalty",
-    "fine",
-    "lawsuit",
-    "regulatory action",
-    "profit falls",
-    "revenue falls",
-    "earnings miss",
-    "order cancelled",
-    "shutdown",
-    "insolvency"
-
-]
-
-
-def news_score(headlines):
-
-    score = 0
-
-    for headline in headlines:
-
-        text = headline.lower()
-
-        for word in POSITIVE_NEWS:
-
-            if word in text:
-                score += 20
-
-        for word in NEGATIVE_NEWS:
-
-            if word in text:
-                score -= 20
-
-    return limit_score(score)
-
-
-# ============================================================
-# 8. FII / DII
-# ============================================================
-
-def fii_dii_score(
-
-    fii_buy,
-    fii_sell,
-    dii_buy,
-    dii_sell
-
-):
-
-    fii_net = fii_buy - fii_sell
-
-    dii_net = dii_buy - dii_sell
-
-    total = fii_net + dii_net
-
-    return limit_score(total)
-
-
-# ============================================================
-# 9. DELIVERY
-# ============================================================
-
-def delivery_score(
-
-    current_delivery,
-    average_delivery
-
-):
-
-    if average_delivery == 0:
-
-        return 0
-
-    ratio = current_delivery / average_delivery
-
-    return limit_score((ratio - 1) * 150)
-
-
-# ============================================================
-# 10. QUARTERLY RESULTS
-# ============================================================
-
-def results_score(
-
-    revenue_growth,
-    profit_growth,
-    margin_change,
-    eps_growth
-
-):
-
-    score = 0
-
-    score += revenue_growth * 1.5
-
-    score += profit_growth * 2
-
-    score += margin_change * 2
-
-    score += eps_growth * 1.5
-
-    return limit_score(score)
-
-
-# ============================================================
-# 11. FUTURES OI
-# ============================================================
-
-def oi_score(
-
-    price_change,
-    oi_change
-
-):
-
-    # Long buildup
-
-    if price_change > 0 and oi_change > 0:
-
-        return 80
-
-    # Short buildup
-
-    if price_change < 0 and oi_change > 0:
-
-        return -80
-
-    # Short covering
-
-    if price_change > 0 and oi_change < 0:
-
-        return 60
-
-    # Long unwinding
-
-    if price_change < 0 and oi_change < 0:
-
-        return -60
-
-    return 0
-
-
-# ============================================================
-# 12. OPTIONS PCR
-# ============================================================
-
-def options_score(pcr):
-
-    if pcr >= 1.30:
-
-        return 70
-
-    if pcr >= 1.10:
-
-        return 40
-
-    if pcr >= 0.90:
-
-        return 0
-
-    if pcr >= 0.70:
-
-        return -40
-
-    return -70
-
-
-# ============================================================
-# 13. SECTOR STRENGTH
-# ============================================================
-
-def sector_score(
-
-    stock_return,
-    sector_return
-
-):
-
-    relative_strength = stock_return - sector_return
-
-    return limit_score(relative_strength * 10)
-
-
-# ============================================================
-# 14. CORPORATE EVENTS
-# ============================================================
-
-def corporate_score(events):
-
-    score = 0
-
-    for event in events:
-
-        event = event.lower()
-
-        if "order" in event:
-            score += 25
-
-        if "acquisition" in event:
-            score += 20
-
-        if "buyback" in event:
-            score += 20
-
-        if "dividend" in event:
-            score += 15
-
-        if "promoter selling" in event:
-            score -= 25
-
-        if "pledge increase" in event:
-            score -= 35
-
-        if "resignation" in event:
-            score -= 20
-
-        if "regulatory action" in event:
-            score -= 30
-
-    return limit_score(score)
-
-
-# ============================================================
-# 15. RISK
-# ============================================================
-
-def risk_score(volatility):
-
-    if volatility < 2:
-
-        return 80
-
-    if volatility < 3:
-
-        return 60
-
-    if volatility < 4:
-
-        return 30
-
-    if volatility < 5:
-
-        return 0
-
-    if volatility < 7:
-
-        return -40
-
-    return -80
-
-
-# ============================================================
-# 16. FALSE SIGNAL FILTER
-# ============================================================
-
-def false_signal_filter(factors, final_score):
-
-    bullish = 0
-    bearish = 0
-
-    for name in WEIGHTS:
-
-        value = factors.get(name, 0)
-
-        if value > 15:
-            bullish += 1
-
-        if value < -15:
-            bearish += 1
-
-
-    # बहुत conflicting data
-
-    if final_score > 38 and bearish >= 4:
-
-        return False
-
-    if final_score < -38 and bullish >= 4:
-
-        return False
-
-
-    return True
-
-
-# ============================================================
-# 17. SIGNAL ENGINE
-# ============================================================
-
-def generate_signal(symbol, factors, price, atr_percent):
-
-    score = weighted_score(factors)
-
-    # False signal filter
-
-    if not false_signal_filter(factors, score):
-
-        return {
-
-            "symbol": symbol,
-            "signal": "WAIT",
-            "score": round(score, 2),
-            "reason": "Conflicting factors"
-
-        }
-
-
-    if score >= 38:
-
-        signal = "BUY"
-
-    elif score <= -38:
-
-        signal = "SELL"
-
-    else:
-
-        signal = "WAIT"
-
-
-    # Model strength — probability नहीं
-
-    confidence = min(
-
-        99,
-
-        50 + abs(score) * 0.45
-
-    )
-
-
-    # ATR based SL / targets
-
-    atr = max(atr_percent, 0.5) / 100
-
-
-    if signal == "BUY":
-
-        stop_loss = price * (1 - atr * 1.2)
-
-        target1 = price * (1 + atr * 1.5)
-
-        target2 = price * (1 + atr * 2.5)
-
-
-    elif signal == "SELL":
-
-        stop_loss = price * (1 + atr * 1.2)
-
-        target1 = price * (1 - atr * 1.5)
-
-        target2 = price * (1 - atr * 2.5)
-
-
-    else:
-
-        stop_loss = None
-        target1 = None
-        target2 = None
-
-
-    # Main reasons
-
-    sorted_factors = sorted(
-
-        factors.items(),
-
-        key=lambda x: abs(x[1]),
-
-        reverse=True
-
-    )
-
-
-    reasons = []
-
-    for name, value in sorted_factors[:5]:
-
-        if value >= 15:
-
-            reasons.append(
-
-                f"{name}: positive"
-
-            )
-
-        elif value <= -15:
-
-            reasons.append(
-
-                f"{name}: negative"
-
-            )
-
+    rsi = (100 - (100 / (1 + rs))).iloc[-1]
+    
+    m_score = (rsi - 50) * 2.5
+    if rsi > 78: m_score -= 40
+    if rsi < 30: m_score -= 30
+
+    # 4. Risk / Volatility
+    daily_returns = close.pct_change()
+    volatility = daily_returns.rolling(20).std().iloc[-1] * 100
+    r_score = 70 if volatility < 2.5 else (30 if volatility < 4.0 else -50)
+
+    # 5. ATR for Targets
+    tr = pd.concat([
+        df['High'] - df['Low'],
+        (df['High'] - df['Close'].shift(1)).abs(),
+        (df['Low'] - df['Close'].shift(1)).abs()
+    ], axis=1).max(axis=1)
+    atr = tr.rolling(14).mean().iloc[-1]
 
     return {
-
-        "symbol": symbol,
-
-        "signal": signal,
-
-        "score": round(score, 2),
-
-        "confidence": round(confidence, 2),
-
-        "price": round(price, 2),
-
-        "stop_loss": round(stop_loss, 2)
-            if stop_loss else None,
-
-        "target1": round(target1, 2)
-            if target1 else None,
-
-        "target2": round(target2, 2)
-            if target2 else None,
-
-        "reasons": ", ".join(reasons)
-
-    }
-
-
-# ============================================================
-# 18. SCAN ALL STOCKS
-# ============================================================
-
-def scan_market(stock_data):
-
-    results = []
-
-    for symbol in STOCKS:
-
-        if symbol not in stock_data:
-
-            continue
-
-        data = stock_data[symbol]
-
-        factors = {
-
-            "news":
-                data.get("news", 0),
-
-            "fii_dii":
-                data.get("fii_dii", 0),
-
-            "volume":
-                data.get("volume", 0),
-
-            "delivery":
-                data.get("delivery", 0),
-
-            "results":
-                data.get("results", 0),
-
-            "technical":
-                data.get("technical", 0),
-
-            "oi":
-                data.get("oi", 0),
-
-            "options":
-                data.get("options", 0),
-
-            "sector":
-                data.get("sector", 0),
-
-            "corporate":
-                data.get("corporate", 0),
-
-            "momentum":
-                data.get("momentum", 0),
-
-            "risk":
-                data.get("risk", 0)
-
-        }
-
-
-        result = generate_signal(
-
-            symbol,
-
-            factors,
-
-            data["price"],
-
-            data.get("atr_percent", 3)
-
-        )
-
-        results.append(result)
-
-
-    df = pd.DataFrame(results)
-
-    return df
-
-
-# ============================================================
-# 19. TOP 2-3 STOCKS
-# ============================================================
-
-def top_signals(df):
-
-    buys = df[
-
-        df["signal"] == "BUY"
-
-    ].sort_values(
-
-        "score",
-
-        ascending=False
-
-    ).head(3)
-
-
-    sells = df[
-
-        df["signal"] == "SELL"
-
-    ].sort_values(
-
-        "score",
-
-        ascending=True
-
-    ).head(3)
-
-
-    return buys, sells
-
-
-# ============================================================
-# 20. EXAMPLE
-# ============================================================
-
-if __name__ == "__main__":
-
-    # यह केवल structure test है।
-    # यहाँ बाद में live API का data आएगा।
-
-    stock_data = {
-
-        "RELIANCE": {
-
-            "price": 1400,
-
-            "atr_percent": 2.5,
-
-            "news": 70,
-
-            "fii_dii": 40,
-
-            "volume": 75,
-
-            "delivery": 50,
-
-            "results": 65,
-
-            "technical": 80,
-
-            "oi": 70,
-
-            "options": 50,
-
-            "sector": 60,
-
-            "corporate": 40,
-
-            "momentum": 65,
-
-            "risk": 40
-
-        },
-
-        "TCS": {
-
-            "price": 3000,
-
-            "atr_percent": 2.2,
-
-            "news": -20,
-
-            "fii_dii": -10,
-
-            "volume": 40,
-
-            "delivery": 20,
-
-            "results": -30,
-
-            "technical": -45,
-
-            "oi": -60,
-
-            "options": -30,
-
-            "sector": -20,
-
-            "corporate": -10,
-
-            "momentum": -40,
-
-            "risk": 30
-
-        }
-
-    }
-
-
-    results = scan_market(stock_data)
-
-
-    buys, sells = top_signals(results)
-
-
-    print("\n==============================")
-    print("TOP BUY")
-    print("==============================")
-
-    print(
-
-        buys.to_string(index=False)
-
-    )
-
-
-    print("\n==============================")
-    print("TOP SELL")
-    print("==============================")
-
-    print(
-
-        sells.to_string(index=False)
-
-    )
-
-
-    results.to_csv(
-
-        "stock_signals.csv",
-
-        index=False
-
-    )
-
-    print(
-
-        "\nResults saved to stock_signals.csv"
-
-    )
+        "technical": limit_score(tech_score),
+        "volume": limit_score(v_score),
+        "momentum": limit_score(m_score),
+        "risk": limit_score(r_score)
+    }, curr_close, atr, vol_ratio
+
+def analyze_stock(symbol):
+    try:
+        ticker = yf.Ticker(symbol)
+        df = ticker.history(period="60d")
+        if df.empty or len(df) < 35:
+            return None
+
+        factors, price, atr, vol_ratio = calculate_factors(df)
+
+        final_score = 0
+        for k, w in WEIGHTS.items():
+            final_score += factors[k] * w
+        final_score = limit_score(final_score)
+
+        if final_score >= 45 and factors["volume"] > 0:
+            signal = "BUY"
+            sl = round(price - (1.2 * atr), 2)
+            t1 = round(price + (1.5 * atr), 2)
+            t2 = round(price + (2.5 * atr), 2)
+            
+            return {
+                "Symbol": symbol.replace(".NS", ""),
+                "Signal": signal,
+                "Score": round(final_score, 1),
+                "Price": round(price, 2),
+                "Target 1": t1,
+                "Target 2": t2,
+                "Stop Loss": sl,
+                "Volume": f"{vol_ratio:.1f}x"
+            }
+        return None
+    except Exception:
+        return None
+
+def scan_full_market():
+    picks = []
+    for s in STOCKS:
+        res = analyze_stock(s)
+        if res:
+            picks.append(res)
+    picks.sort(key=lambda x: x["Score"], reverse=True)
+    return picks[:5]
+
+# UI DASHBOARD
+st.set_page_config(page_title="AI Multi-Factor Radar", page_icon="⚡", layout="wide")
+st.title("🎯 Multi-Factor NSE Alpha Radar")
+st.caption("Auto Weighted Technical, Momentum, Volume & Volatility Engine")
+
+if "picks" not in st.session_state:
+    st.session_state.picks = []
+
+col1, col2 = st.columns(2)
+col1.metric("System Status", "ACTIVE 🟢")
+col2.metric("Top Candidates Found", len(st.session_state.picks))
+
+if st.button("🚀 Run Multi-Factor AI Scan"):
+    with st.spinner("50 शेयरों का मल्टी-फैक्टर एनालिसिस चल रहा है..."):
+        st.session_state.picks = scan_full_market()
+    st.rerun()
+
+st.subheader("⚡ Top 3-5 Filtered High-Probability Setups")
+if st.session_state.picks:
+    st.dataframe(pd.DataFrame(st.session_state.picks), use_container_width=True)
+else:
+    st.info("सिस्टम तैयार है। ऊपर दिए गए बटन पर क्लिक करके 50 शेयरों का ताज़ा विश्लेषण निकालें।")
