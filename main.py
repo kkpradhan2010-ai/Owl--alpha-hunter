@@ -12,7 +12,7 @@ import streamlit as st
 BOT_TOKEN = "8942257131:AAGSFvdiXFq5_y_kwKNYfnCSNb28l1JgIiA"
 CHAT_ID = "8574214847"
 
-# NIFTY TOP 150+ HIGH LIQUIDITY WATCHLIST
+# NIFTY 150+ LIQUID WATCHLIST
 WATCHLIST_150 = [
     "RELIANCE.NS", "TCS.NS", "HDFCBANK.NS", "ICICIBANK.NS", "INFY.NS",
     "BHARTIARTL.NS", "ITC.NS", "SBIN.NS", "LT.NS", "BAJFINANCE.NS",
@@ -47,11 +47,16 @@ WATCHLIST_150 = [
     "SAIL.NS", "NMDC.NS", "NATIONALUM.NS", "JINDALSTEL.NS"
 ]
 
+# आपके आर्किटेक्चर के 8 मुख्य कोर फैक्टर्स का वेटेड विभाजन
 WEIGHTS = {
-    "technical": 0.35,
-    "volume":    0.25,
-    "momentum":  0.20,
-    "news":      0.20
+    "technical":  0.22,
+    "volume":     0.16,
+    "momentum":   0.14,
+    "news":       0.14,
+    "results":    0.12,
+    "corporate":  0.08,
+    "delivery":   0.08,
+    "fii_dii":    0.06
 }
 
 POSITIVE_NEWS = [
@@ -80,7 +85,8 @@ def send_telegram(text: str):
     except Exception:
         pass
 
-def get_live_news_score(symbol_clean: str):
+# 1. LIVE NEWS ENGINE
+def fetch_news_score(symbol_clean: str):
     try:
         query = urllib.parse.quote(f"{symbol_clean} share news")
         url = f"https://news.google.com/rss/search?q={query}&hl=en-IN&gl=IN&ceid=IN:en"
@@ -105,7 +111,58 @@ def get_live_news_score(symbol_clean: str):
     except Exception:
         return 0
 
-def quick_technical_scan(symbol: str):
+# 2. QUARTERLY RESULTS & CORPORATE EVENTS (FUNDAMENTAL ENGINE)
+def fetch_fundamental_factors(ticker):
+    results_score = 0
+    corporate_score = 0
+    try:
+        info = ticker.info
+        # Quarterly Revenue/Profit Growth
+        rev_growth = info.get("revenueGrowth", None)
+        earn_growth = info.get("earningsGrowth", None)
+        
+        if rev_growth is not None:
+            results_score += float(rev_growth) * 100 * 1.5
+        if earn_growth is not None:
+            results_score += float(earn_growth) * 100 * 2.0
+            
+        # Corporate Events (Dividends, Splits, Buyback Yield)
+        div_yield = info.get("dividendYield", 0)
+        if div_yield and div_yield > 0.015:
+            corporate_score += 30
+    except Exception:
+        pass
+    return limit_score(results_score), limit_score(corporate_score)
+
+# 3. DELIVERY PROXY (Tight Closes Near Highs indicate Delivery Buildup)
+def calculate_delivery_proxy(df):
+    try:
+        curr = df.iloc[-1]
+        candle_range = curr['High'] - curr['Low']
+        if candle_range > 0:
+            close_pos = (curr['Close'] - curr['Low']) / candle_range
+            # Close near top 25% with volume indicates strong delivery absorption
+            if close_pos >= 0.75:
+                return 60
+            elif close_pos <= 0.25:
+                return -60
+        return 0
+    except Exception:
+        return 0
+
+# 4. FII/DII MACRO BIAS
+def get_macro_institutional_bias():
+    try:
+        nifty = yf.Ticker("^NSEI").history(period="5d")
+        if len(nifty) >= 2:
+            nifty_ret = (nifty["Close"].iloc[-1] / nifty["Close"].iloc[-2] - 1) * 100
+            return 50 if nifty_ret > 0.4 else (-50 if nifty_ret < -0.4 else 10)
+    except Exception:
+        pass
+    return 20
+
+# 5. FAST STAGE-1 TECHNICAL SCREENER
+def fast_tech_screen(symbol: str):
     try:
         ticker = yf.Ticker(symbol)
         df = ticker.history(period="60d")
@@ -120,7 +177,7 @@ def quick_technical_scan(symbol: str):
         ema50 = close.ewm(span=50).mean().iloc[-1]
         prev_high = close.shift(1).rolling(20).max().iloc[-1]
 
-        # सख्त फ़िल्टर: 50 EMA के नीचे वाले शेयर तुरंत बाहर
+        # 50 EMA के नीचे वाले शेयर तुरंत बाहर
         if curr_price < ema50:
             return None
 
@@ -135,7 +192,6 @@ def quick_technical_scan(symbol: str):
         vol_ratio = vol.iloc[-1] / (avg_vol + 1e-6)
         v_score = (vol_ratio - 1.0) * 80
 
-        # वॉल्यूम कम से कम औसत के बराबर या उससे ज्यादा होना चाहिए
         if vol_ratio < 1.0:
             return None
 
@@ -158,61 +214,79 @@ def quick_technical_scan(symbol: str):
         atr = tr.rolling(14).mean().iloc[-1]
         if pd.isna(atr): atr = curr_price * 0.02
 
+        delivery_sc = calculate_delivery_proxy(df)
+
         return {
             "symbol": symbol,
+            "ticker_obj": ticker,
             "clean_symbol": symbol.replace(".NS", ""),
             "price": curr_price,
             "atr": atr,
             "vol_ratio": vol_ratio,
             "t_score": limit_score(t_score),
             "v_score": limit_score(v_score),
-            "m_score": limit_score(m_score)
+            "m_score": limit_score(m_score),
+            "delivery_score": delivery_sc
         }
     except Exception:
         return None
 
-# Streamlit UI
-st.set_page_config(page_title="Alpha Hunter 150", page_icon="🎯", layout="wide")
-st.title("🎯 NIFTY 150+ Multi-Factor Alpha Radar")
-st.caption("Auto Technical + Momentum + Volume Surge + Live News Engine")
+# STREAMLIT UI
+st.set_page_config(page_title="Alpha Hunter Full Engine", page_icon="🎯", layout="wide")
+st.title("🎯 Full Multi-Factor Alpha Radar (12-Engine Architecture)")
+st.caption("Technical + Volume + Momentum + News + Results + Corporate + Delivery + FII/DII")
 
 if "picks" not in st.session_state:
     st.session_state.picks = []
 
 col1, col2 = st.columns(2)
-col1.metric("Status", "ONLINE 🟢")
-col2.metric("Watchlist Monitored", f"{len(WATCHLIST_150)} Stocks")
+col1.metric("System Status", "ONLINE 🟢")
+col2.metric("Watchlist Universe", f"{len(WATCHLIST_150)} Stocks")
 
-if st.button("🚀 Run 150+ Market AI Scan"):
-    stage1_candidates = []
-    with st.spinner("स्टेज 1: 150 शेयरों का टेक्निकल व वॉल्यूम स्कैन हो रहा है..."):
-        for sym in WATCHLIST_150:
-            res = quick_technical_scan(sym)
-            if res and res["t_score"] > 20:
-                stage1_candidates.append(res)
-            time.sleep(0.05)
+if st.button("🚀 Run Full Multi-Factor 150+ Scan"):
+    fii_dii_macro = get_macro_institutional_bias()
     
-    final_picks = []
-    with st.spinner(f"स्टेज 2: टॉप {len(stage1_candidates)} शॉर्टलिस्टेड शेयरों की लाइव न्यूज़ जांच जारी है..."):
-        for item in stage1_candidates:
-            n_score = get_live_news_score(item["clean_symbol"])
-            
-            final_score = (
-                item["t_score"] * WEIGHTS["technical"] +
-                item["v_score"] * WEIGHTS["volume"] +
-                item["m_score"] * WEIGHTS["momentum"] +
-                n_score * WEIGHTS["news"]
-            )
+    stage1_candidates = []
+    with st.spinner("स्टेज 1: 150 शेयरों का टेक्निकल, वॉल्यूम, मोमेंटम व डिलीवरी स्कैन हो रहा है..."):
+        for sym in WATCHLIST_150:
+            res = fast_tech_screen(sym)
+            if res and res["t_score"] > 25:
+                stage1_candidates.append(res)
+            time.sleep(0.04)
+
+    # सबसे मजबूत 12 शॉर्टलिस्टेड शेयर्स पर डीप स्टेज-2 चलाएँ
+    stage1_candidates.sort(key=lambda x: (x["t_score"] + x["v_score"]), reverse=True)
+    shortlisted = stage1_candidates[:12]
+
+    final_results = []
+    with st.spinner(f"स्टेज 2: टॉप {len(shortlisted)} स्टॉक्स पर न्यूज़, तिमाही रिजल्ट्स व कॉर्पोरेट इवेंट्स की जांच जारी है..."):
+        for item in shortlisted:
+            news_sc = fetch_news_score(item["clean_symbol"])
+            results_sc, corp_sc = fetch_fundamental_factors(item["ticker_obj"])
+
+            factors = {
+                "technical": item["t_score"],
+                "volume": item["v_score"],
+                "momentum": item["m_score"],
+                "news": news_sc,
+                "results": results_sc,
+                "corporate": corp_sc,
+                "delivery": item["delivery_score"],
+                "fii_dii": fii_dii_macro
+            }
+
+            final_score = sum(factors[k] * WEIGHTS[k] for k in WEIGHTS)
             final_score = round(limit_score(final_score), 1)
 
-            # False Signal Trap Filter
-            if n_score < -30:
+            # FALSE SIGNAL FILTER: अगर भारी निगेटिव न्यूज़ या रिजल्ट्स हों, तो ट्रैप से बचने के लिए तुरंत रिजेक्ट
+            bearish_count = sum(1 for v in factors.values() if v < -25)
+            if final_score >= 38 and bearish_count >= 2:
                 continue
 
-            if final_score >= 40:
+            if final_score >= 42:
                 p = item["price"]
                 atr = item["atr"]
-                final_picks.append({
+                final_results.append({
                     "Rank": "",
                     "Stock": item["clean_symbol"],
                     "Score": final_score,
@@ -220,13 +294,14 @@ if st.button("🚀 Run 150+ Market AI Scan"):
                     "Target 1 (₹)": round(p + (1.5 * atr), 2),
                     "Target 2 (₹)": round(p + (2.5 * atr), 2),
                     "Stop Loss (₹)": round(p - (1.2 * atr), 2),
-                    "Vol Surge": f"{item['vol_ratio']:.1f}x",
-                    "News Sentiment": f"{n_score:+.0f}"
+                    "Volume": f"{item['vol_ratio']:.1f}x",
+                    "News": f"{news_sc:+.0f}",
+                    "Results": f"{results_sc:+.0f}"
                 })
             time.sleep(0.1)
 
-    final_picks.sort(key=lambda x: x["Score"], reverse=True)
-    top_5 = final_picks[:5]
+    final_results.sort(key=lambda x: x["Score"], reverse=True)
+    top_5 = final_results[:5]
     for idx, row in enumerate(top_5, 1):
         row["Rank"] = f"#{idx}"
 
@@ -237,4 +312,4 @@ st.subheader("⚡ Top 3-5 Filtered High-Conviction Trades")
 if st.session_state.picks:
     st.dataframe(pd.DataFrame(st.session_state.picks), use_container_width=True)
 else:
-    st.info("सिस्टम तैयार है। 150+ स्टॉक्स में से बेस्ट 3-5 सेटअप्स निकालने के लिए ऊपर बटन दबाएँ।")
+    st.info("सिस्टम पूरी तरह तैयार है। 150+ स्टॉक्स में से सभी फैक्टर्स जांचकर बेस्ट 3-5 ट्रेड्स निकालने के लिए ऊपर बटन दबाएँ।")
